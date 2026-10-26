@@ -284,6 +284,14 @@ textarea{min-height:76px;resize:vertical}
       <button class="btn" style="margin-top:8px" id="addCatBtn">+ Add category</button>
     </div>
     <div class="card">
+      <div class="lab" style="margin-bottom:8px">📧 Auto-add from Gmail &amp; SMS</div>
+      <p class="note">Connect your Google Sheet. Bank payments it finds in your Gmail and SMS then show up here by themselves, marked “Auto”. Edit or delete them like any entry; a deleted one won't come back.</p>
+      <div class="field" style="margin-top:10px"><label for="syncUrl">Web app link (from Apps Script)</label><input id="syncUrl" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+      <div class="field"><label for="syncToken">Secret code (🤖 Auto-add tab, cell B5)</label><input id="syncToken" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+      <div class="btnrow"><button class="btn primary" id="syncSave">Save &amp; sync now</button><button class="btn" id="syncOff">Disconnect</button></div>
+      <p class="note" id="syncStatus" style="margin-top:8px"></p>
+    </div>
+    <div class="card">
       <div class="lab" style="margin-bottom:8px">Backup &amp; data</div>
       <p class="note">Everything is stored only in this browser on this device, photos included. Back up now and then so you never lose your entries.</p>
       <div class="btnrow" style="margin-top:10px">
@@ -596,6 +604,7 @@ function txRow(t){
   else if(a) sub.push(`<span class="chiplite"><i class="dot" style="background:${a.color}"></i>${esc(a.name)}</span>`);
   if(t.split) sub.push(`<span class="chiplite"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>Split${t.split.with?' · '+esc(t.split.with):''}</span>`);
   if(t.sms) sub.push('<span class="chiplite src">SMS</span>');
+  if(t.src==='auto') sub.push('<span class="chiplite src">Auto</span>');
   if(t.photos.length) sub.push(`<span class="chiplite"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><rect x="3" y="5" width="18" height="15" rx="2"/><circle cx="12" cy="12.5" r="3.5"/></svg>${t.photos.length}</span>`);
   return `<button class="tx" data-tx="${t.id}">
     <span class="ic" style="background:${tint(color,.16)}">${icon(ik,color)}</span>
@@ -677,6 +686,9 @@ function renderInsights(){
 }
 function renderSettings(){
   $('#setBudget').value=S.budget||'';
+  if(document.activeElement!==$('#syncUrl')) $('#syncUrl').value=S.sync?.url||'';
+  if(document.activeElement!==$('#syncToken')) $('#syncToken').value=S.sync?.token||'';
+  syncStatusText();
   $('#setCats').innerHTML=S.categories.map(c=>`<div class="catrow"><span class="ic" style="background:${tint(c.color,.16)}">${icon(c.icon,c.color,18)}</span><span style="min-width:0">${esc(c.name)}<div class="s">${c.kind==='income'?'Income':'Expense'}</div></span>
     <span style="display:flex;gap:6px;align-items:center">${c.kind==='expense'?`<input type="number" min="0" inputmode="decimal" value="${c.budget||''}" placeholder="Budget" data-catbud="${c.id}" id="cb-${c.id}" style="width:96px;padding:8px" aria-label="Budget for ${esc(c.name)}">`:''}<button class="iconbtn" data-delcat="${c.id}" aria-label="Delete ${esc(c.name)}" style="width:34px;height:34px;color:var(--muted)">✕</button></span></div>`).join('');
   $('#storageNote').textContent = storageOK ? `Saved on this device · ${S.txns.length} transactions · ${S.txns.reduce((n,t)=>n+t.photos.length,0)} photos` : 'This browser is blocking storage, so entries will be lost when you close the page. Use Download backup to keep them.';
@@ -906,11 +918,64 @@ $('#eraseBtn').addEventListener('click',()=>$('#eraseConfirm').hidden=false);
 $('#eraseNo').addEventListener('click',()=>$('#eraseConfirm').hidden=true);
 $('#eraseYes').addEventListener('click',()=>{ S=defaultState(false); save(); $('#eraseConfirm').hidden=true; render(); renderSettings(); toast('All data erased'); });
 
+/* ---------- sync with the Google Sheet (entries found in Gmail / SMS) ---------- */
+const CAT_ALIAS={'transport':'trav','travel':'trav','rent & home':'rent','bills & recharge':'bill','fun & outings':'fun','learning':'edu','gifts':'gift','others':'oth','side income':'oinc','interest & refunds':'oinc','gifts received':'oinc','salary':'sal'};
+function syncStatusText(){
+  const el=$('#syncStatus'); if(!el) return;
+  if(!S.sync||!S.sync.url){ el.textContent='Not connected.'; return; }
+  if(S.sync.err && !S.sync.last){ el.textContent='Could not connect: '+S.sync.err+'.'; el.style.color='var(--warn)'; return; }
+  el.style.color='';
+  el.textContent = S.sync.last ? 'Connected · last synced '+new Date(S.sync.last).toLocaleString('en-IN',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})+(S.sync.err?' · last try failed: '+S.sync.err:'') : 'Connected · not synced yet';
+}
+function fromSheet(e){
+  const type = e.type==='Income'?'income':(e.type==='Transfer'?'transfer':'expense');
+  const byName = n => n && S.accounts.find(a=>a.name.toLowerCase()===String(n).toLowerCase());
+  const byDigits = d => d && S.accounts.find(a=>String(a.last4||'').split(/[,\s]+/).some(x=>x && x.replace(/\D/g,'').slice(-4)===String(d).slice(-4)));
+  let account = byName(e.account) || byDigits(e.last4);
+  let note = String(e.note||'').replace(/^🤖\s*auto\s*·?\s*/,'').replace(/\s*·?\s*pick account.*$/,'').trim();
+  if(/^(SMS|Email)$/i.test(note)) note='from '+note;
+  if(!account){ account=S.accounts[0]; note=(note?note+' · ':'')+'check the account'; }
+  const nm = String(e.category||'').replace(/^[^A-Za-z]+/,'').trim(); const low=nm.toLowerCase();
+  const kind = type==='income'?'income':'expense';
+  let c = S.categories.find(x=>x.name.toLowerCase()===low && x.kind===kind) || (CAT_ALIAS[low] && cat(CAT_ALIAS[low]));
+  if(!c && nm && type!=='transfer'){ c={id:uid(),name:nm,icon:'tag',kind,budget:0,color:PALETTE[S.categories.length%PALETTE.length]}; S.categories.push(c); }
+  if(!c && type!=='transfer'){ c = cat(kind==='income'?'oinc':'oth'); note=(note?note+' · ':'')+'pick a category'; }
+  return {id:uid(),date:/^\d{4}-\d{2}-\d{2}$/.test(e.date)?e.date:todayStr(),type,amount:Number(e.amount)||0,account:account?.id||null,
+    toAccount: type==='transfer' ? (byName(e.toAccount)?.id||null) : null, category: type==='transfer'?'':(c?.id||''),
+    title:String(e.title||''),tags:String(e.tags||'').split(/[\s,]+/).map(x=>x.replace(/^#+/,'')).filter(Boolean),
+    note:note.trim(),photos:[],split:null,created:Date.now(),src:'auto'};
+}
+let syncing=false;
+async function syncNow(silent){
+  const c=S.sync; if(!c||!c.url||!c.token||syncing) return; syncing=true;
+  try{
+    const r=await fetch(c.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'entries',token:c.token})});
+    const j=await r.json();
+    if(!j.ok) throw new Error(j.result==='Wrong secret code'?'the secret code doesn\'t match':(j.result||'the sheet said no'));
+    S.imported=S.imported||{}; let n=0;
+    for(const e of (j.entries||[])){ if(!e.id||S.imported[e.id]) continue; S.imported[e.id]=1; if(Number(e.amount)>0){ S.txns.push(fromSheet(e)); n++; } }
+    c.last=Date.now(); c.err=''; save(); render();
+    if(n||!silent) toast(n? n+' new entr'+(n===1?'y':'ies')+' from Gmail & SMS' : 'Up to date');
+  }catch(err){
+    c.err = (err && err.message && !/fetch|network|json/i.test(err.message)) ? err.message : 'check the link and your internet';
+    save(); if(!silent) toast('Could not sync: '+c.err);
+  }finally{ syncing=false; syncStatusText(); }
+}
+function maybeAutoSync(){ if(S.sync&&S.sync.url&&navigator.onLine!==false&&Date.now()-(S.sync.last||0)>3*60*1000) syncNow(true); }
+$('#syncSave').addEventListener('click',()=>{
+  const url=$('#syncUrl').value.trim(), token=$('#syncToken').value.trim();
+  if(!/^https:\/\/script\.google(usercontent)?\.com\//.test(url)) return toast('Paste the Web app link from Apps Script (starts with https://script.google.com/)');
+  if(!token) return toast('Paste the secret code from the 🤖 Auto-add tab');
+  S.sync={url,token,last:0,err:''}; save(); syncNow(false);
+});
+$('#syncOff').addEventListener('click',()=>{ S.sync=null; save(); renderSettings(); toast('Disconnected. Entries already added stay.'); });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') maybeAutoSync(); });
+
 /* ---------- boot ---------- */
 let framed=true; try{ framed = window.self!==window.top; }catch(e){}
 if(framed) $('#dlBackup').hidden=true;  // file downloads only work when the page is opened directly
 render();
-openDB().then(dbGet).then(saved=>{ if(saved && Array.isArray(saved.txns)){ S=Object.assign(defaultState(false),saved); } else if(storageOK){ save(); } render(); });
+openDB().then(dbGet).then(saved=>{ if(saved && Array.isArray(saved.txns)){ S=Object.assign(defaultState(false),saved); } else if(storageOK){ save(); } render(); maybeAutoSync(); });
 })();
 </script>
 
